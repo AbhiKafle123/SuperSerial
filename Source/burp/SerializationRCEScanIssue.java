@@ -1,5 +1,10 @@
 /*
-	Implementation of IScanIssue interface for Java object serialization remote code execution vulnerability
+	SerializationRCEScanIssue.java
+	
+	v0.3 (12/22/2015)
+	
+	Implementation of IScanIssue interface for Java object serialization remote code execution vulnerability. Consult constructIssueDetail() comment header
+	for information regarding detail ID for creating new issues.
 */
 
 package burp;
@@ -18,7 +23,6 @@ public class SerializationRCEScanIssue implements IScanIssue {
 	private String remediationDetail;
 	private String severity;
 	private URL url;
-	private int detailId; //identifier for how vulnerability was detected
 	
 	private static final String ISSUE_BACKGROUND = "Java deserialization vulnerabilities occur when an application fails to properly sanitize user-supplied Java "+
 													"serialized data. Just like any other HTTP request, all user-controlled input must be validated on the server side."+
@@ -37,7 +41,7 @@ public class SerializationRCEScanIssue implements IScanIssue {
 													" read in the following article entitled “Look-ahead Java deserialization” written in January 2013: "+
 													"<a href=\"http://www.ibm.com/developerworks/library/se-lookahead/\">http://www.ibm.com/developerworks/library/se-lookahead/</a>";
 	
-	public SerializationRCEScanIssue(IHttpRequestResponse rr,IHttpService hs,URL u,int id) {
+	public SerializationRCEScanIssue(IHttpRequestResponse rr,IHttpService hs,URL u,int detailId,int enc) {
 		confidence = "Tentative";
 		httpMessages = new IHttpRequestResponse[] {rr};
 		httpService = hs;
@@ -48,59 +52,69 @@ public class SerializationRCEScanIssue implements IScanIssue {
 		remediationDetail = null;
 		severity = "High";
 		url = u;
-		detailId = id;
 		
 		//set correct Issue Detail
-		issueDetail = constructIssueDetail(detailId);
+		issueDetail = constructIssueDetail(detailId,enc);
 	}
 	
-	/* input: what was found
-	* 1: request header
-	* 2: request data
-	* 3: request header and data
-	* 4: response header
-	* 5: request header, response header
-	* 6: request data, response header
-	* 7: request header and data, response header
-	* 8: response data
-	* 9: request header, response data
-	* 10: request data, response data
-	* 11: request header and data, response data
-	* 12: response header and data
-	* 13: request header, response header and data
-	* 14: request data, response header and data
-	* 15: request header and data, response header and data */
-	public String constructIssueDetail(int id) {
+	/* input:
+	* detailId:
+	* 	1: request header
+	* 	2: request data
+	* 	3: request header and data
+	* 	4: response header
+	* 	5: request header, response header
+	* 	6: request data, response header
+	* 	7: request header and data, response header
+	* 	8: response data
+	* 	9: request header, response data
+	* 	10: request data, response data
+	* 	11: request header and data, response data
+	* 	12: response header and data
+	* 	13: request header, response header and data
+	* 	14: request data, response header and data
+	* 	15: request header and data, response header and data
+	* encId: whether base64-encoded data was found
+	*	0: not found
+	*	1: found but unconfirmed (was not decoded)
+	*	2: found and confirmed (decoded) */
+	private String constructIssueDetail(int detailId,int encId) {
 		String detail = "The application ";
 		
 		//application "may" or "appears to" transmit
 		//"may": no actual data found
 		//"appears to": data found
-		if((id==1) || (id==4) || (id==5)) detail += "may ";
+		if((detailId==1) || (detailId==4) || (detailId==8 && encId==1) || (detailId==5)) detail += "may ";
 		else detail += "appears to ";
 		detail += "transmit Java serialized objects. ";
 		
 		//content-type header, skip if none found
-		if((id!=2) && (id!=8) && (id!=10)) {
+		if((detailId!=2) && (detailId!=8) && (detailId!=10)) {
 			detail += "The Content-Type header of the ";
 			
-			if((id==1) || (id==3) || (id==9) || (id==11)) detail += "request was"; //request header (only) found
-			else if((id==4) || (id==6) || (id==12) || (id==14)) detail += "server response was"; //response header (only) found
+			if((detailId==1) || (detailId==3) || (detailId==9) || (detailId==11)) detail += "request was"; //request header (only) found
+			else if((detailId==4) || (detailId==6) || (detailId==12) || (detailId==14)) detail += "server response was"; //response header (only) found
 			else detail += "request and the server response were"; //request and response headers found
 			
 			detail += " set to <b>application/x-java-serialized-object</b>. ";
 		}
 		
 		//data, skip if none found
-		if((id!=1) && (id!=4) && (id!=5)) {
-			if((id==2) || (id==8) || (id==10)) detail += "The ";
+		if((detailId!=1) && (detailId!=4) && (detailId!=5)) {
+			if((detailId==2) || (detailId==8) || (detailId==10)) detail += "The ";
 			else detail += "Additionally, the ";
 			
-			if((id==2) || (id==3) || (id==6) || (id==7)) detail += "request body"; //request data (only) found
-			else if((id==8) || (id==9) || (id==12) || (id==13)) detail += "server response body"; //response data (only) found
+			if((detailId==2) || (detailId==3) || (detailId==6) || (detailId==7)) detail += "request body"; //request data (only) found
+			else if((detailId==8) || (detailId==9) || (detailId==12) || (detailId==13)) { //response data (only) found
+				detail += "server response ";
+				if(encId>0) {
+					if(encId==2) detail += "contained a base64-encoded block beginning with value <b>rO0AB</b>. When this block was decoded, it";
+					else if(encId==1) detail += "contained the value <b>rO0AB</b>. This may be the start of a base64-encoded block containing a java serialized object. ";
+				} else detail += "body";
+			}
 			else detail += "request body and the server response body"; //request and response data found
 			
-			detail += " began with the hexadecimal value <b>0xACED0005</b>. ";
+			if(encId!=1) detail += " began with the hexadecimal value <b>0xACED0005</b>. ";
 		}
 		
 		detail += "This indicates that the URL may be subject to attack.";

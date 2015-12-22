@@ -1,7 +1,9 @@
 /*
-	BurpExtender.java v0.2
+	BurpExtender.java
 	
-	Super Serial - Passive
+	v0.3 (12/22/2015)
+	
+	SuperSerial - Passive
 	
 	Extension including passive scan check for Java serialized objects in server response. Checks are based on response 
 	content-type and data. Scanner issue is created if content-type is application/x-java-serialized-object OR 
@@ -31,7 +33,7 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 		callbacks = mCallbacks;
 		helpers = callbacks.getHelpers();
 		
-		callbacks.setExtensionName("Super Serial - Passive");
+		callbacks.setExtensionName("SuperSerial - Passive");
 		
 		callbacks.registerScannerCheck(this);
 	}
@@ -40,13 +42,14 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 	public List<IScanIssue> doPassiveScan(IHttpRequestResponse baseRequestResponse) {
 		List<IScanIssue> issues = null; //issues to report (if any)
 		
+		//check 1: search for plain-text Java serialized objects in request and response (JBoss)
 		byte[] req = baseRequestResponse.getRequest();
 		IRequestInfo reqInfo = helpers.analyzeRequest(req);
 		byte[] resp = baseRequestResponse.getResponse();
 		IResponseInfo respInfo = helpers.analyzeResponse(resp);
 		
-		int[][] reqHighlights = processRequest(reqInfo,req);
-		int[][] respHighlights = processResponse(respInfo,resp);
+		int[][] reqHighlights = processJBossRequest(reqInfo,req);
+		int[][] respHighlights = processJBossResponse(respInfo,resp);
 		ArrayList<int[]> reqMarkers = null;
 		ArrayList<int[]> respMarkers = null;
 		
@@ -75,11 +78,90 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 			}
 		}
 		
-		if(resId>0) { //vuln found, create highlight Request/Response and scanner issue
+		if(resId>0) { //potentional JBoss vuln found, create highlight Request/Response and scanner issue (with approriate detail ID)
 			issues = new ArrayList<IScanIssue>(1);
 			IHttpRequestResponseWithMarkers issueRR = callbacks.applyMarkers(baseRequestResponse,reqMarkers,respMarkers);
-			SerializationRCEScanIssue issue = new SerializationRCEScanIssue(issueRR,issueRR.getHttpService(),helpers.analyzeRequest(issueRR).getUrl(),resId);
+			SerializationRCEScanIssue issue = new SerializationRCEScanIssue(issueRR,issueRR.getHttpService(),helpers.analyzeRequest(issueRR).getUrl(),resId,0);
 			issues.add(issue);
+			return issues;
+		} else {
+			
+			//check 2: search for base64-encoded java serialized object(s) in response only (WebSphere)
+			respHighlights = null;
+			
+			if(respInfo.getStatedMimeType().equalsIgnoreCase("XML") || respInfo.getInferredMimeType().equalsIgnoreCase("XML")) { //if response contains XML, convert to request for easy parsing
+				int respDataStart = respInfo.getBodyOffset();
+				byte[] respData = new byte[resp.length-respDataStart];
+				int i=respDataStart;
+				int j=0;
+				while(i<resp.length) {
+					respData[j] = resp[i];
+					i++;
+					j++;
+				}
+				
+				byte[] respReq = helpers.buildHttpMessage(reqInfo.getHeaders(),respData);
+				IRequestInfo respReqInfo = helpers.analyzeRequest(respReq);
+				List<IParameter> params = respReqInfo.getParameters();
+				Iterator<IParameter> paramsItr = params.iterator();
+				ArrayList<byte[]> results = new ArrayList<byte[]>();
+				while(paramsItr.hasNext()) { //Search for XML values starting with "rO0AB"
+					IParameter param = paramsItr.next();
+					String paramVal = param.getValue();
+					if((paramVal.length()>=4) && (paramVal.substring(0,5).equals("rO0AB"))) {
+						byte[] decoded = helpers.base64Decode(paramVal);
+						if(decoded.length>=4) {
+							if(decoded[0] == FILE_HEADER_0) {
+								if(decoded[1] == FILE_HEADER_1) {
+									if(decoded[2] == FILE_HEADER_2) {
+										if(decoded[3] == FILE_HEADER_3) {
+											results.add(paramVal.getBytes());
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				
+				int resStart;
+				if(results.size()>0) { //potential WebSphere vuln found, create highlight indexes and create issue (with "response data only" detail ID and base64 confirmed encId)
+					respMarkers = new ArrayList<int[]>();
+					Iterator<byte[]> resultsItr = results.iterator();
+					while(resultsItr.hasNext()) {
+						byte[] result = resultsItr.next();
+						resStart = helpers.indexOf(resp,result,true,respDataStart,resp.length);
+						int[] marker = {resStart,resStart+result.length};
+						respMarkers.add(marker);
+					}
+					
+					issues = new ArrayList<IScanIssue>(1);
+					IHttpRequestResponseWithMarkers issueRR = callbacks.applyMarkers(baseRequestResponse,null,respMarkers);
+					SerializationRCEScanIssue issue = new SerializationRCEScanIssue(issueRR,issueRR.getHttpService(),helpers.analyzeRequest(issueRR).getUrl(),8,2);
+					issues.add(issue);
+					return issues;
+				}
+			} else { //not XML: search indiscriminately for "rO0AB" string in response body
+				int searchIndex = respInfo.getBodyOffset();
+				ArrayList<int[]> results = new ArrayList<int[]>();
+				
+				int resStart = 0;
+				while(resStart!=-1) {
+					resStart = helpers.indexOf(resp,"rO0AB".getBytes(),true,searchIndex,resp.length);
+					if(resStart!=-1 && (!isBase64Char(resp[resStart-1]))) { //if value was found and appears to be start of base64-encoded value: add result
+						results.add(new int[] {resStart,resStart+5});
+						searchIndex=resStart+5;
+					}
+				}
+				
+				if(results.size()>0) { //potential WebSphere vuln found, create highlight indexes and create issue (with "response data only" detail ID and base64 unconfirmed encId)
+					respMarkers = results;
+					issues = new ArrayList<IScanIssue>(1);
+					IHttpRequestResponseWithMarkers issueRR = callbacks.applyMarkers(baseRequestResponse,null,respMarkers);
+					SerializationRCEScanIssue issue = new SerializationRCEScanIssue(issueRR,issueRR.getHttpService(),helpers.analyzeRequest(issueRR).getUrl(),8,1);
+					issues.add(issue);
+				}
+			}
 		}
 		
 		return issues;
@@ -95,7 +177,7 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 	*	duplicate Issue Detail: duplicate vulnerability (report existing only)
 	*	different Issue Detail:
 	*		existing issue did not include data, new issue does: new vulnerability (report new only)
-	*		existing issue included data but not in response, new issue does: new vulnerability (report new only
+	*		existing issue included data but not in response, new issue does: new vulnerability (report new only)
 	*different HTTP methods: new vulnerability (report both) */
 	@Override
 	public int consolidateDuplicateIssues(IScanIssue existingIssue,IScanIssue newIssue) {
@@ -123,8 +205,7 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 				if(!existingIssueDetail.contains("0xACED0005") && newIssueDetail.contains("0xACED0005")) { //existing issue does not contain serialized data, new issue does: replace
 					retVal = 1;
 				} else if(existingIssueDetail.contains("0xACED0005") && newIssueDetail.contains("0xACED0005")) {
-					if(!existingIssueDetail.contains("server response body began with") && newIssueDetail.contains("server response body began with")) { /*existing issue does not contain
-																																serialized data in response, new issue does: replace */
+					if(!existingIssueDetail.contains("server response body began with") && newIssueDetail.contains("server response body began with")) { //existing issue does not contain serialized data in response, new issue does: replace
 						retVal = 1;
 					}
 				}
@@ -134,18 +215,21 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 		return retVal;
 	}
 	
+	
+	//helper methods
+	
 	//check for vuln in request
-	private int[][] processRequest(IRequestInfo reqInfo,byte[] req) {
+	private int[][] processJBossRequest(IRequestInfo reqInfo,byte[] req) {
 		int dataStart = reqInfo.getBodyOffset();
 		List<String> headers = reqInfo.getHeaders();
-		return processMessage(headers,req,dataStart);
+		return processJBossMessage(headers,req,dataStart);
 	}
 	
 	//check for vuln in response
-	private int[][] processResponse(IResponseInfo respInfo,byte[] resp) {
+	private int[][] processJBossResponse(IResponseInfo respInfo,byte[] resp) {
 		int dataStart = respInfo.getBodyOffset();
 		List<String> headers = respInfo.getHeaders();
-		return processMessage(headers,resp,dataStart);
+		return processJBossMessage(headers,resp,dataStart);
 	}
 	
 	//check for vuln
@@ -154,7 +238,7 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 	//int[2]: vuln found
 	//	if int[0] is defined: content-type header found
 	//	if int[1] is defined: data found
-	private int[][] processMessage(List<String> headers,byte[] message,int dataStart) {
+	private int[][] processJBossMessage(List<String> headers,byte[] message,int dataStart) {
 		int[][] highlights = null;
 		boolean vuln = false; //if a potential vulnerability is found
 		boolean contentHighlight = false; //if correct content-type header is found and should be highlighted
@@ -213,5 +297,14 @@ public class BurpExtender implements IBurpExtender,IScannerCheck {
 		}
 		
 		return highlights;
+	}
+	
+	//test if inputted char belongs to the base64 character-set
+	private boolean isBase64Char(byte b) {
+		byte[] base64Chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/+".getBytes();
+		for(int i=0;i<base64Chars.length;i++) {
+			if(b==base64Chars[i]) return true;
+		}
+		return false;
 	}
 }
